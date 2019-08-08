@@ -267,9 +267,9 @@ if __name__=="__main__":
         if epoch == epoch_num:
             break
 
-        if num_path % node_number == 0:
+        if num_path == node_number:
             print("number path sampled: %d" % num_path)
-            print("averaged loss: %f" % (cumulative_loss/node_number))
+            print("averaged loss: %f" % (cumulative_loss/num_path))
             Ekar.model.save_weights(checkpoint_prefix.format(epoch=epoch))
             epoch += 1
             cumulative_loss = .0
