@@ -2,3 +2,4 @@ __*
 .idea*
 *.pkl
 .DS_Store
+training_checkpoints/*

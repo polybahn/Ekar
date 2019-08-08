@@ -7,6 +7,7 @@ from tensorflow.keras.optimizers import SGD, Adam
 from load_data import  DataLoader
 import numpy as np
 import tensorflow as tf
+import os
 np.random.seed(123)
 tf.random.set_seed(123)
 
@@ -226,7 +227,7 @@ class Ekar(object):
         sampled_path, policy_memory, loss_per_step = self.train_one_path(self.path_length, user_id)
         # print(sampled_path)
         # print(policy_memory)
-        print(str(loss_per_step))
+        return np.mean(loss_per_step)
         # with tf.GradientTape() as tape:
         #     dest_node = sampled_path[-1][-1]  # the destination node of this path
         #     reward = self.get_reward(user_id, dest_node)
@@ -244,10 +245,35 @@ class Ekar(object):
 
 
 if __name__=="__main__":
+    np.random.seed(3115)
+    tf.random.set_seed(3115)
+
     data_loader = DataLoader()
     keep_rate=0.8
     Ekar = Ekar(keep_rate, data_loader)
-    epoch_num = 30000
-    while epoch_num:
-        Ekar.train_one_step()
-        epoch_num -= 1
+
+    epoch_num = 300000
+    node_number = 13771
+
+    # Directory where the checkpoints will be saved
+    checkpoint_dir = './training_checkpoints'
+    # Name of the checkpoint files
+    checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt_{epoch}")
+
+    num_path = 0
+    cumulative_loss = .0
+    epoch = 0
+    while True:
+        if epoch == epoch_num:
+            break
+
+        if num_path % node_number == 0:
+            print("number path sampled: %d" % num_path)
+            print("averaged loss: %f" % (cumulative_loss/node_number))
+            Ekar.model.save_weights(checkpoint_prefix.format(epoch=epoch))
+            epoch += 1
+            cumulative_loss = .0
+            num_path = 0
+        step_loss = Ekar.train_one_step()
+        cumulative_loss += step_loss
+        num_path += 1
