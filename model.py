@@ -1,0 +1,253 @@
+# 2. we need an LSTM module, input action, output state vector s_t. One at a time
+# LSTM module.
+from tensorflow.python.keras import Model, Sequential, Input
+from tensorflow.python.keras.layers import Input, Dense, LSTM, Embedding, concatenate, Lambda, dot, Softmax, Flatten
+from tensorflow.python.keras.models import Model
+from tensorflow.keras.optimizers import SGD, Adam
+from load_data import  DataLoader
+import numpy as np
+import tensorflow as tf
+np.random.seed(123)
+tf.random.set_seed(123)
+
+
+class Ekar(object):
+
+    def __init__(self, keep_rate, data_loader):
+        self.batch_size = 1
+        self.emb_dim = 32
+        self.path_length = 3    # here we define the path length everytime we sample. It's the T in the original paper
+        self.state_emb_size = 20
+        self.action_emb_size = self.emb_dim * 2    # the input is always a concatenation of [relation, entity] embedding, thus size of 2 x emb_size
+
+        self.num_users = data_loader.num_users
+        self.num_items = data_loader.num_items
+        self.num_relas = data_loader.num_relas
+        self.num_embs = self.num_users + self.num_items
+
+        self.node_emb_matrix = data_loader.node_emb_matrix
+        self.rel_emb_matrix = data_loader.rel_emb_matrix
+        for i in range(self.node_emb_matrix.shape[0]):
+            for j in range(self.node_emb_matrix.shape[1]):
+                if np.isinf(self.node_emb_matrix[i][j]):
+                    print("nan!")
+                    print(self.node_emb_matrix[i][j])
+
+
+        self.model = self.build_model()
+        self.optimizer = self.get_optimizer()
+
+        self.lookup_next = data_loader.lookup_next
+        self.reward_table = data_loader.reward_table
+        self.positive_rewards = data_loader.positive_rewards
+        self.keep_rate = keep_rate
+
+
+
+    def build_model(self):
+        rela_input = Input(batch_shape=(self.batch_size, 1), name="relation_input")
+        node_input = Input(batch_shape=(self.batch_size, 1), name="node_input")
+
+        # # Generate some random weights
+        # rela_embedding_weights = np.random.rand(num_relas, emb_dim)
+        # node_embedding_weights = np.random.rand(num_vocab, emb_dim)
+
+        rela_embedding_layer = Embedding(
+                 input_dim=self.num_relas+1,
+                 output_dim=self.emb_dim,
+                 trainable=False,
+                 name='relation_embedding_layer',
+                 weights=[self.rel_emb_matrix],
+                 batch_input_shape=[self.batch_size, 1]) (rela_input)
+        node_embedding_layer = Embedding(
+                 input_dim=self.num_embs+1,
+                 output_dim=self.emb_dim,
+                 trainable=False,
+                 name='node_embedding_layer',
+                 weights=[self.node_emb_matrix],
+                 batch_input_shape=[self.batch_size, 1]) (node_input)
+
+        # get the embedding for each action
+        concat_layer = tf.keras.layers.concatenate(inputs=[rela_embedding_layer, node_embedding_layer], name="rela_node_concat", axis=-1)
+
+        lstm_layer = LSTM(units=self.state_emb_size,
+                           return_sequences=True,
+                           stateful=True,
+                           recurrent_initializer='glorot_uniform')(concat_layer)
+
+        # policy module
+        dense_unit_size = 128
+        policy_layer = Dense(units=dense_unit_size,
+                               name="first_dense_with_relu",
+                               kernel_initializer="glorot_uniform",
+                               bias_initializer="zeros",
+                               activation="relu")(lstm_layer)
+        # This is y_t
+        hidden_policy_y = Dense(units=self.action_emb_size,
+                               name="second_dense_without_activation",
+                               kernel_initializer="glorot_uniform",
+                               bias_initializer="zeros",
+                               activation=None
+                              ) (policy_layer)
+
+        # Now we define another module to get embedding for all activities
+        all_rela_input = Input(batch_shape=(self.batch_size, None), name="all_possible_relation_input")
+        all_node_input = Input(batch_shape=(self.batch_size, None), name="all_possible_node_input")
+
+        all_rela_embedding_layer = Embedding(
+                 input_dim=self.num_relas+1,
+                 output_dim=self.emb_dim,
+                 trainable=False,
+                 name='all_relation_embedding_layer',
+                 weights=[self.rel_emb_matrix],
+                 batch_input_shape=[self.batch_size, None]) (all_rela_input)
+
+        all_node_embedding_layer = Embedding(
+                 input_dim=self.num_embs+1,
+                 output_dim=self.emb_dim,
+                 trainable=False,
+                 name='all_node_embedding_layer',
+                 weights=[self.node_emb_matrix],
+                 batch_input_shape=[self.batch_size, None]) (all_node_input)
+
+        all_concat_layer = tf.keras.layers.concatenate(inputs=[all_rela_embedding_layer, all_node_embedding_layer], name="all_rela_node_concat", axis=-1)
+
+        # Next we time all a_t's with y_t
+        a_y_dot_layer = tf.squeeze(dot(inputs=[all_concat_layer, hidden_policy_y], axes=-1, name="a_y_dot"), axis=-1)
+
+        # Then finally get the softmax probability
+        softmax_layer = Softmax(axis=-1, name="softmax")(a_y_dot_layer)
+
+        model = Model(inputs=[rela_input, node_input, all_rela_input, all_node_input], outputs=[softmax_layer], name="ekar")
+
+        model.summary()
+        return model
+
+    def mask_next_actions(self, possible_states, keep_rate):
+        num_keep = np.math.floor(len(possible_states) * keep_rate)
+        if num_keep == 0:
+            num_keep = 1
+        mask = np.zeros(len(possible_states), dtype=np.int32)
+        mask[:num_keep] = 1
+        np.random.shuffle(mask)
+        masked_arr = np.array([action for action, m in zip(possible_states, mask) if m])  # to make size compatible
+        #     masked_arr = ma.masked_array(possible_states, mask=mask)
+        return masked_arr
+
+    def train_one_path(self, path_length, target_user_general_id):
+        #     self.model.trainable = False
+        cur_rela = self.num_relas - 1
+        cur_node = target_user_general_id  # here we sample one user form the training set
+
+        # every time a new path comes in, we need to reset model initial state s_0
+        self.model.reset_states()
+        gradBuffer = self.model.trainable_variables
+        grads_memory = list()
+
+        # clear grad buffer
+        for ix, grad in enumerate(gradBuffer):
+            gradBuffer[ix] = grad * 0
+
+        path = [(cur_rela, cur_node)]
+        policy_memory = list()
+        loss_per_step = list()
+        for i in range(path_length):
+            # get all id for next state
+            next_actions = np.array(self.lookup_next[cur_node], dtype=np.int32)
+            #         print(next_actions.shape)
+            # actions after masking
+            next_actions = self.mask_next_actions(next_actions, self.keep_rate)
+            num_next_options = next_actions.shape[0]
+            #         print(next_actions.shape)
+            # extend action space length to maximum number of out degree
+
+            next_rels, next_nodes = tf.unstack(next_actions,
+                                               axis=-1)  # unzip the actions to make rela_list and node_list
+            #         print(next_rels)
+            #         print(tf.expand_dims(next_nodes, 0))
+
+            with tf.GradientTape() as tape:
+                # get probability of all of nexrt actions
+                probabilities = self.model(inputs=[tf.expand_dims([cur_rela], 0),
+                                              tf.expand_dims([cur_node], 0),
+                                              tf.expand_dims(next_rels, 0),
+                                              tf.expand_dims(next_nodes, 0)])
+            #    print(probabilities)
+                # sample one id for next actions
+                # sampled_id = tf.random.categorical(probabilities, num_samples=1)[-1, 0].numpy()
+                sampled_id = np.random.choice(num_next_options, size=1, p=probabilities[-1].numpy())[-1]
+                # compute loss
+                loss = - tf.math.log(probabilities[-1][sampled_id])
+                loss_per_step.append(loss.numpy())
+            # compute gradients in this step
+            grads = tape.gradient(loss, self.model.trainable_variables)
+            grads_memory.append(grads)
+
+            # now we have the input for next step
+            policy_memory.append(probabilities[-1][sampled_id].numpy())
+            # update current relation and node for entering next step
+            cur_rela, cur_node = next_actions[sampled_id]
+            path.append((cur_rela, cur_node))
+
+        # get reward of this path
+        dest_node = path[-1][-1]  # the destination node of this path
+        reward = self.get_reward(target_user_general_id, dest_node)
+        # calculate gradients
+        for grads in grads_memory:
+            for ix, grad in enumerate(grads):
+                gradBuffer[ix] += reward * grad
+
+        # apply gradients
+        self.optimizer.apply_gradients(zip(gradBuffer, self.model.trainable_variables))
+        return path, policy_memory, loss_per_step
+
+    def sigmoid_similarity_lookup_phi(self, first_node, second_node):
+        if (first_node, second_node) in self.reward_table:
+            return self.reward_table[(first_node, second_node)]
+        return .0
+
+    def get_reward(self, target_user_id, destination_node):
+        """return the reward for a certain path in graph g' which starts from target_user and ends with desitination_node"""
+        if (target_user_id, destination_node) not in self.reward_table:
+            return -1.0
+        return self.reward_table[(target_user_id, destination_node)]
+
+    def sample_a_user(self):
+        return np.random.choice(list(self.positive_rewards.keys()), 1)[-1]
+
+    def get_optimizer(self):
+        return Adam(learning_rate=0.001, clipnorm=1.)
+
+    # @tf.function
+    def train_one_step(self):
+        # first sample one target user
+        user_id = self.sample_a_user()
+        # then sample a path of this user
+        sampled_path, policy_memory, loss_per_step = self.train_one_path(self.path_length, user_id)
+        # print(sampled_path)
+        # print(policy_memory)
+        print(str(loss_per_step))
+        # with tf.GradientTape() as tape:
+        #     dest_node = sampled_path[-1][-1]  # the destination node of this path
+        #     reward = self.get_reward(user_id, dest_node)
+        #     loss = tf.reduce_sum(-reward * np.log(policy_memory))
+        #     print(-reward * np.log(policy_memory))
+        #     print("loss:\t%f" % loss)
+        #     print("reward:\t%f" % reward)
+
+        # grads = tape.gradient(loss, self.model.trainable_variables)
+        # print("grads:" + str(grads))
+        # self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        # return loss
+
+
+
+
+if __name__=="__main__":
+    data_loader = DataLoader()
+    keep_rate=0.8
+    Ekar = Ekar(keep_rate, data_loader)
+    epoch_num = 30000
+    while epoch_num:
+        Ekar.train_one_step()
+        epoch_num -= 1
