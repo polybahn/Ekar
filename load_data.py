@@ -4,6 +4,8 @@ import numpy as np
 import os
 import random
 import pickle
+import math
+random.seed(123)
 
 
 class DataLoader(object):
@@ -46,6 +48,11 @@ class DataLoader(object):
         self.user_space, self.user_ref, self.rela_space = self.create_user_rel_space(ratings, kg)
         self.generate_new_ratings_and_kg(ratings, kg)
         self.get_rev_indexing()
+
+        # shuffle the rating
+        random.shuffle(self.new_ratings)
+        self.split_dataset()
+
         self.build_action_lookup()
         self.create_reward_table()
         self.node_emb_matrix, self.rel_emb_matrix = self.get_embedding_matrices()
@@ -59,6 +66,25 @@ class DataLoader(object):
 
     def get_path(self, file_name):
             return os.path.join(self.data_path, file_name)
+
+    def split_dataset(self):
+        # generate train, val, test set
+        train_size, val_size, test_size = [math.floor(len(self.new_ratings) * portion) for portion in [0.6, 0.2, 0.2]]
+        self.train_set = self.new_ratings[:train_size]
+        self.val_set = self.new_ratings[train_size: train_size + val_size]
+        self.test_set = self.new_ratings[train_size + val_size:]
+
+        self.val_dict = dict()
+        for u, i, r in self.val_set:
+            if u not in self.val_dict:
+                self.val_dict[u] = set()
+            self.val_dict[u].add(i)
+
+        self.test_dict = dict()
+        for u, i, r in self.test_set:
+            if u not in self.test_dict:
+                self.test_dict[u] = set()
+            self.test_dict[u].add(i)
 
     def map_entity_to_item(self):
         # load data
@@ -261,7 +287,7 @@ class DataLoader(object):
 
         # Then we need to generate a ground-truth reward table for every user
         self.positive_rewards = dict()
-        for user, item, _ in self.new_ratings:
+        for user, item, _ in self.train_set:
             # here we don't care about the rating is 0 or 1. If user interacted with the item, then reward is 1
             if user not in self.positive_rewards:
                 self.positive_rewards[user] = set()
@@ -323,8 +349,8 @@ class DataLoader(object):
                 if (user_id, item_id) in score_phi:
                     self.reward_table[(user, item)] = score_phi[(user_id, item_id)]
                     # print("phi:\t" + str(score_phi[(user_id, item_id)]))
-        # add positive reward from the ratings in dataset
-        for user, item, _ in self.new_ratings:
+        # add positive reward from the ratings in training dataset
+        for user, item, _ in self.train_set:
             self.reward_table[(user, item)] = 1.0
 
     def get_embedding_matrices(self):
