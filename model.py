@@ -4,18 +4,21 @@ from tensorflow.python.keras import Model, Sequential, Input
 from tensorflow.python.keras.layers import Input, Dense, LSTM, Embedding, concatenate, Lambda, dot, Softmax, Flatten
 from tensorflow.python.keras.models import Model
 from tensorflow.keras.optimizers import SGD, Adam
-from load_data import  DataLoader
+from load_data import DataLoader
 import numpy as np
 import tensorflow as tf
 import os
+import random
+random.seed(123)
 np.random.seed(123)
 tf.random.set_seed(123)
 
 
+
 class Ekar(object):
 
-    def __init__(self, keep_rate, data_loader):
-        self.batch_size = 1
+    def __init__(self, batch_size, keep_rate, data_loader):
+        self.batch_size = batch_size
         self.emb_dim = 32
         self.path_length = 3    # here we define the path length everytime we sample. It's the T in the original paper
         self.state_emb_size = 20
@@ -33,6 +36,8 @@ class Ekar(object):
                 if np.isinf(self.node_emb_matrix[i][j]):
                     print("nan!")
                     print(self.node_emb_matrix[i][j])
+        print(self.node_emb_matrix[-1])
+        print(self.rel_emb_matrix[-1])
 
 
         self.model = self.build_model()
@@ -101,7 +106,7 @@ class Ekar(object):
                  trainable=False,
                  name='all_relation_embedding_layer',
                  weights=[self.rel_emb_matrix],
-                 batch_input_shape=[self.batch_size, None]) (all_rela_input)
+                 batch_input_shape=[self.batch_size, None])(all_rela_input)
 
         all_node_embedding_layer = Embedding(
                  input_dim=self.num_embs+1,
@@ -109,7 +114,7 @@ class Ekar(object):
                  trainable=False,
                  name='all_node_embedding_layer',
                  weights=[self.node_emb_matrix],
-                 batch_input_shape=[self.batch_size, None]) (all_node_input)
+                 batch_input_shape=[self.batch_size, None])(all_node_input)
 
         all_concat_layer = tf.keras.layers.concatenate(inputs=[all_rela_embedding_layer, all_node_embedding_layer], name="all_rela_node_concat", axis=-1)
 
@@ -132,8 +137,80 @@ class Ekar(object):
         mask[:num_keep] = 1
         np.random.shuffle(mask)
         masked_arr = np.array([action for action, m in zip(possible_states, mask) if m])  # to make size compatible
-        #     masked_arr = ma.masked_array(possible_states, mask=mask)
         return masked_arr
+
+    def mask_batch_next_actions(self, list_possible_states, keep_rate):
+        num_keeps = [max(np.math.floor(len(possible_states) * keep_rate), 1) for possible_states in list_possible_states]
+        masks = [[1] * num_keep + [0] * (len(possible_states) - num_keep)for num_keep, possible_states in zip(num_keeps, list_possible_states)]
+        for mask in masks:
+            random.shuffle(mask)
+        masked = [[state for m, state in zip(mask, possible_states) if m] for mask, possible_states in zip(masks, list_possible_states)]
+        return masked
+
+
+    def train_batch_paths(self, target_user_ids):
+        cur_relas = [self.num_relas - 1] * batch_size
+        cur_nodes = target_user_ids
+
+        self.model.reset_states()
+
+        gradBuffer = self.model.trainable_variables
+        grads_memory = list()
+
+        # clear grad buffer
+        for ix, grad in enumerate(gradBuffer):
+            gradBuffer[ix] = grad * 0
+
+        # path = [[item] for item in list(zip(cur_relas, cur_nodes))]
+        # # policy_memory = list()
+        loss_per_step = list()
+
+        for i in range(self.path_length):
+            next_actions = [self.lookup_next[cur_node] for cur_node in cur_nodes]
+            next_actions = self.mask_batch_next_actions(next_actions, self.keep_rate)
+            len_actions = [len(next_action) for next_action in next_actions]
+
+            max_num_options = max([len(actions) for actions in next_actions])
+
+            next_rels = np.array([[action[0] for action in actions] + [self.num_relas]*(max_num_options-len(actions)) for actions in next_actions], dtype=np.int32)
+            next_nodes = np.array([[action[1] for action in actions]+ [self.num_embs]*(max_num_options-len(actions)) for actions in next_actions], dtype=np.int32)
+            cur_relas = np.array(cur_relas, dtype=np.int32)
+            cur_nodes = np.array(cur_nodes, dtype=np.int32)
+            with tf.GradientTape() as tape:
+                # get probability of all of nexrt actions
+                probabilities = self.model(inputs=[tf.expand_dims(cur_relas, -1),
+                                                   tf.expand_dims(cur_nodes, -1),
+                                                   next_rels,
+                                                   next_nodes]).numpy()
+                # now we remove all the invalid action probabilities
+                probabilities = [probab[:valid_action_len] / sum(probab[:valid_action_len]) for valid_action_len, probab in zip(len_actions, probabilities)]
+                sampled_ids = [np.random.choice(len(actions), size=1, p=probability)[-1] for actions, probability in zip(next_actions, probabilities)]
+                print(sampled_ids)
+
+                # compute loss
+
+                loss = tf.reduce_mean(-tf.math.log(tf.convert_to_tensor([probs[index] for probs, index in zip(probabilities, sampled_ids)])))
+                print(loss)
+                loss_per_step.append(loss.numpy())
+
+            grads = tape.gradient(loss, self.model.trainable_variables)
+            grads_memory.append(grads)
+
+            cur_relas = [next_rel[index] for index, next_rel in zip(sampled_ids, next_rels)]
+            cur_nodes = [next_node[index] for index, next_node in zip(sampled_ids, next_nodes)]
+
+        mean_reward = np.mean(self.get_rewards(target_user_ids, cur_nodes))
+
+        # calculate mean gradient
+        for grads in grads_memory:
+            for ix, grad in enumerate(grads):
+                gradBuffer[ix] += mean_reward * grad
+
+        # apply gradients
+        self.optimizer.apply_gradients(zip(gradBuffer, self.model.trainable_variables))
+
+
+
 
     def train_one_path(self, path_length, target_user_general_id):
         #     self.model.trainable = False
@@ -207,14 +284,20 @@ class Ekar(object):
             return self.reward_table[(first_node, second_node)]
         return .0
 
+    def get_rewards(self, target_user_ids, destination_ids):
+        return [self.get_reward(user, dest) for user, dest in zip(target_user_ids, destination_ids)]
+
     def get_reward(self, target_user_id, destination_node):
         """return the reward for a certain path in graph g' which starts from target_user and ends with desitination_node"""
         if (target_user_id, destination_node) not in self.reward_table:
-            return -1.0
+            return - 1.0
         return self.reward_table[(target_user_id, destination_node)]
 
     def sample_a_user(self):
         return np.random.choice(list(self.positive_rewards.keys()), 1)[-1]
+
+    def sample_batch_users(self):
+        return np.random.choice(list(self.positive_rewards.keys()), self.batch_size).tolist()
 
     def get_optimizer(self):
         return Adam(learning_rate=0.001, clipnorm=1.)
@@ -222,12 +305,14 @@ class Ekar(object):
     # @tf.function
     def train_one_step(self):
         # first sample one target user
-        user_id = self.sample_a_user()
+        user_ids = self.sample_batch_users()
         # then sample a path of this user
-        sampled_path, policy_memory, loss_per_step = self.train_one_path(self.path_length, user_id)
+        # sampled_path, policy_memory, loss_per_step = \
+
+        self.train_batch_paths(user_ids)
         # print(sampled_path)
         # print(policy_memory)
-        return np.mean(loss_per_step)
+        return 0
         # with tf.GradientTape() as tape:
         #     dest_node = sampled_path[-1][-1]  # the destination node of this path
         #     reward = self.get_reward(user_id, dest_node)
@@ -242,38 +327,43 @@ class Ekar(object):
         # return loss
 
 
-
-
 if __name__=="__main__":
-    np.random.seed(3115)
-    tf.random.set_seed(3115)
-
     data_loader = DataLoader()
     keep_rate=0.8
-    Ekar = Ekar(keep_rate, data_loader)
+    batch_size = 5
+    Ekar = Ekar(batch_size, keep_rate, data_loader)
 
-    epoch_num = 300000
-    node_number = 13771
+    Ekar.train_one_step()
 
-    # Directory where the checkpoints will be saved
-    checkpoint_dir = './training_checkpoints'
-    # Name of the checkpoint files
-    checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt_{epoch}")
-
-    num_path = 0
-    cumulative_loss = .0
-    epoch = 0
-    while True:
-        if epoch == epoch_num:
-            break
-
-        if num_path == node_number:
-            print("number path sampled: %d" % num_path)
-            print("averaged loss: %f" % (cumulative_loss/num_path))
-            Ekar.model.save_weights(checkpoint_prefix.format(epoch=epoch))
-            epoch += 1
-            cumulative_loss = .0
-            num_path = 0
-        step_loss = Ekar.train_one_step()
-        cumulative_loss += step_loss
-        num_path += 1
+# if __name__=="__main__":
+#
+#     data_loader = DataLoader()
+#     keep_rate=0.8
+#     batch_size = 512
+#     Ekar = Ekar(batch_size, keep_rate, data_loader)
+#
+#     epoch_num = 300000
+#     node_number = 13771
+#
+#     # Directory where the checkpoints will be saved
+#     checkpoint_dir = './training_checkpoints'
+#     # Name of the checkpoint files
+#     checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt_{epoch}")
+#
+#     num_path = 0
+#     cumulative_loss = .0
+#     epoch = 0
+#     while True:
+#         if epoch == epoch_num:
+#             break
+#
+#         if num_path == node_number:
+#             print("number path sampled: %d" % num_path)
+#             print("averaged loss: %f" % (cumulative_loss/num_path))
+#             Ekar.model.save_weights(checkpoint_prefix.format(epoch=epoch))
+#             epoch += 1
+#             cumulative_loss = .0
+#             num_path = 0
+#         step_loss = Ekar.train_one_step()
+#         cumulative_loss += step_loss
+#         num_path += 1
