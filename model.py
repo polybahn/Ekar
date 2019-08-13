@@ -351,10 +351,8 @@ if __name__=="__main__":
     # Name of the checkpoint files
     checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt_{epoch}")
 
-    # # Evaluation
-    # hr_10, ndcg_10 = Ekar.evaluate(hitrate_n=10, ndcg_n=10)
-    # print("averaged hit rate at %d:\t%.4f " % (10, hr_10))
-    # print("averaged NDCG at %d:\t%.4f " % (10, ndcg_10))
+    if os.path.exists(checkpoint_dir):
+        Ekar.model.load_weights(tf.train.latest_checkpoint(checkpoint_dir))
 
     # Training
     num_path = 0
