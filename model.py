@@ -9,8 +9,8 @@ import numpy as np
 import tensorflow as tf
 import os
 import operator
-np.random.seed(123)
-tf.random.set_seed(123)
+np.random.seed(3115)
+tf.random.set_seed(3115)
 
 
 class Ekar(object):
@@ -267,7 +267,6 @@ class Ekar(object):
                 if len(next_paths) > self.beam_width:
                     next_paths = next_paths[:self.beam_width]
             cur_paths = next_paths
-
         # print(cur_paths[:10])
         return cur_paths
 
@@ -298,15 +297,37 @@ class Ekar(object):
         # print(policy_memory)
         return np.mean(loss_per_step)
 
-    def evaluate(self, hit_n):
+    def evaluate(self, hitrate_n, ndcg_n):
+        # compute perfect possible dcg
+        idcg = np.sum([1/np.log2(i+2) for i in range(ndcg_n)])
+
         accumulated_prob = .0
+        accumulated_ndcg = .0
+
+        # test_cnt = 0
         for user, items in self.val_dict.items():
+            # test_cnt += 1
+            # if test_cnt > 10:
+            #     break
             output_paths = self.beam_search(user)
-            last_items = [path.path[-1][-1] for path in output_paths][:hit_n] # only take top n item to evaluate
-            hit_prob = len([i for i in last_items if i in items]) / float(hit_n)
+            last_items = [path.path[-1][-1] for path in output_paths] # only take top n item to evaluate
+
+            # calculate hit rate
+            hit_prob = len([i for i in last_items[:hitrate_n] if i in items]) / float(hitrate_n)
             accumulated_prob += hit_prob
+
+            # calculate ndcg
+            dcg = np.sum([1/np.log2(i+2) if item in items else 0 for i, item in enumerate(last_items[:ndcg_n])])
+            normalizer = idcg
+            if len(items) < ndcg_n:
+                normalizer = np.sum([1/np.log2(i+2) for i in range(len(items))])
+            ndcg = dcg / normalizer
+            accumulated_ndcg += ndcg
+
         avg_hit_prob = accumulated_prob / float(len(self.val_dict))
-        print(avg_hit_prob)
+        avg_ndcg = accumulated_ndcg / float(len(self.val_dict))
+
+        return avg_hit_prob, avg_ndcg
 
 
 
@@ -319,10 +340,10 @@ if __name__=="__main__":
     tf.random.set_seed(3115)
 
     data_loader = DataLoader()
-    keep_rate=0.8
+    keep_rate = 0.8
     Ekar = Ekar(keep_rate, data_loader)
 
-    epoch_num = 10
+    epoch_num = 1000
     node_number = 13771
 
     # Directory where the checkpoints will be saved
@@ -330,7 +351,10 @@ if __name__=="__main__":
     # Name of the checkpoint files
     checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt_{epoch}")
 
-    Ekar.evaluate(hit_n=10)
+    # # Evaluation
+    # hr_10, ndcg_10 = Ekar.evaluate(hitrate_n=10, ndcg_n=10)
+    # print("averaged hit rate at %d:\t%.4f " % (10, hr_10))
+    # print("averaged NDCG at %d:\t%.4f " % (10, ndcg_10))
 
     # Training
     num_path = 0
@@ -341,9 +365,16 @@ if __name__=="__main__":
             break
 
         if num_path == node_number:
-            print("number path sampled: %d" % num_path)
-            print("averaged loss: %f" % (cumulative_loss/num_path))
+            print("Epoch:\t%d" % epoch)
+            print("number path sampled:\t%d" % num_path)
+            print("averaged loss:\t%f" % (cumulative_loss/num_path))
             Ekar.model.save_weights(checkpoint_prefix.format(epoch=epoch))
+            # Evaluation
+            if epoch % 10 == 0:
+                hr_10, ndcg_10 = Ekar.evaluate(hitrate_n=10, ndcg_n=10)
+                print("averaged hit rate at %d:\t%.4f " % (10, hr_10))
+                print("averaged NDCG at %d:\t%.4f " % (10, ndcg_10))
+
             epoch += 1
             cumulative_loss = .0
             num_path = 0
@@ -351,5 +382,5 @@ if __name__=="__main__":
         cumulative_loss += step_loss
         num_path += 1
 
-    Ekar.evaluate(hit_n=10)
+
 
