@@ -217,7 +217,7 @@ class Ekar(object):
 
         # apply gradients
         self.optimizer.apply_gradients(zip(gradBuffer, self.model.trainable_variables))
-        return path, policy_memory, loss_per_step
+        return path, policy_memory, [loss * reward for loss in loss_per_step]
 
 
     def beam_search(self, user_id):
@@ -365,11 +365,12 @@ if __name__=="__main__":
         if num_path == node_number:
             print("Epoch:\t%d" % epoch)
             print("number path sampled:\t%d" % num_path)
-            print("averaged loss:\t%f" % (cumulative_loss/num_path))
+            print("averaged training loss:\t%f" % (cumulative_loss/num_path))
             Ekar.model.save_weights(checkpoint_prefix.format(epoch=epoch))
             # Evaluation
             if epoch % 10 == 0:
                 hr_10, ndcg_10 = Ekar.evaluate(hitrate_n=10, ndcg_n=10)
+                print("evaluation loss:\t%f" % )
                 print("averaged hit rate at %d:\t%.4f " % (10, hr_10))
                 print("averaged NDCG at %d:\t%.4f " % (10, ndcg_10))
 
