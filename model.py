@@ -370,7 +370,6 @@ if __name__=="__main__":
             # Evaluation
             if epoch % 10 == 0:
                 hr_10, ndcg_10 = Ekar.evaluate(hitrate_n=10, ndcg_n=10)
-                print("evaluation loss:\t%f" % )
                 print("averaged hit rate at %d:\t%.4f " % (10, hr_10))
                 print("averaged NDCG at %d:\t%.4f " % (10, ndcg_10))
 
