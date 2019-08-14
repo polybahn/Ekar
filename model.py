@@ -1,9 +1,10 @@
 # 2. we need an LSTM module, input action, output state vector s_t. One at a time
 # LSTM module.
 from tensorflow.python.keras import Model, Sequential, Input
-from tensorflow.python.keras.layers import Input, Dense, LSTM, Embedding, concatenate, Lambda, dot, Softmax, Flatten
+from tensorflow.python.keras.layers import InputLayer, Dense, LSTM, Embedding, concatenate, Lambda, dot, Softmax, Flatten
 from tensorflow.python.keras.models import Model
 from tensorflow.keras.optimizers import SGD, Adam
+import tensorflow.keras.backend as KB
 from load_data import DataLoader
 import numpy as np
 import tensorflow as tf
@@ -29,6 +30,8 @@ class Ekar(object):
         self.num_relas = data_loader.num_relas
         self.num_embs = self.num_users + self.num_items
 
+        self.max_out_degree = data_loader.max_out_degree
+
         self.node_emb_matrix = data_loader.node_emb_matrix
         self.rel_emb_matrix = data_loader.rel_emb_matrix
         for i in range(self.node_emb_matrix.shape[0]):
@@ -36,8 +39,6 @@ class Ekar(object):
                 if np.isinf(self.node_emb_matrix[i][j]):
                     print("nan!")
                     print(self.node_emb_matrix[i][j])
-        print(self.node_emb_matrix[-1])
-        print(self.rel_emb_matrix[-1])
 
 
         self.model = self.build_model()
@@ -51,8 +52,11 @@ class Ekar(object):
 
 
     def build_model(self):
-        rela_input = Input(batch_shape=(self.batch_size, 1), name="relation_input")
-        node_input = Input(batch_shape=(self.batch_size, 1), name="node_input")
+        rela_input = Input(shape=(1,), batch_size=self.batch_size, dtype=tf.int32, name="relation_input")
+        node_input = Input(shape=(1,), batch_size=self.batch_size, dtype=tf.int32, name="node_input")
+
+        hidden_cell_input = Input(batch_shape=(self.batch_size, self.state_emb_size), name="hidden_input")
+        state_cell_input = Input(batch_shape=(self.batch_size, self.state_emb_size), name="state_cell_input")
 
         # # Generate some random weights
         # rela_embedding_weights = np.random.rand(num_relas, emb_dim)
@@ -62,24 +66,29 @@ class Ekar(object):
                  input_dim=self.num_relas+1,
                  output_dim=self.emb_dim,
                  trainable=False,
+                 mask_zero=True,
                  name='relation_embedding_layer',
-                 weights=[self.rel_emb_matrix],
-                 batch_input_shape=[self.batch_size, 1]) (rela_input)
+                 weights=[self.rel_emb_matrix])(rela_input)
         node_embedding_layer = Embedding(
                  input_dim=self.num_embs+1,
                  output_dim=self.emb_dim,
                  trainable=False,
+                 mask_zero=True,
                  name='node_embedding_layer',
                  weights=[self.node_emb_matrix],
-                 batch_input_shape=[self.batch_size, 1]) (node_input)
+                 )(node_input)
 
         # get the embedding for each action
         concat_layer = tf.keras.layers.concatenate(inputs=[rela_embedding_layer, node_embedding_layer], name="rela_node_concat", axis=-1)
 
-        lstm_layer = LSTM(units=self.state_emb_size,
-                           return_sequences=True,
-                           stateful=True,
-                           recurrent_initializer='glorot_uniform')(concat_layer)
+        lstm_layer, hidden_state, cell_state = LSTM(units=self.state_emb_size,
+                                                    name="LSTM",
+                                                    return_sequences=True,
+                                                    return_state=True,
+                                                    stateful=False,
+                                                    recurrent_initializer='glorot_uniform')(inputs=concat_layer,
+                                                                                            initial_state=[hidden_cell_input,
+                                                                                                           state_cell_input])
 
         # policy module
         dense_unit_size = 128
@@ -94,37 +103,42 @@ class Ekar(object):
                                kernel_initializer="glorot_uniform",
                                bias_initializer="zeros",
                                activation=None
-                              ) (policy_layer)
+                              )(policy_layer)
 
         # Now we define another module to get embedding for all activities
-        all_rela_input = Input(batch_shape=(self.batch_size, None), name="all_possible_relation_input")
-        all_node_input = Input(batch_shape=(self.batch_size, None), name="all_possible_node_input")
+        all_rela_input = Input(shape=(None,), batch_size=self.batch_size, dtype=tf.int32, name="all_possible_relation_input")
+        all_node_input = Input(shape=(None,), batch_size=self.batch_size, dtype=tf.int32, name="all_possible_node_input")
 
         all_rela_embedding_layer = Embedding(
                  input_dim=self.num_relas+1,
                  output_dim=self.emb_dim,
+                 mask_zero=True,
                  trainable=False,
                  name='all_relation_embedding_layer',
-                 weights=[self.rel_emb_matrix],
-                 batch_input_shape=[self.batch_size, None])(all_rela_input)
+                 weights=[self.rel_emb_matrix])(all_rela_input)
 
         all_node_embedding_layer = Embedding(
                  input_dim=self.num_embs+1,
                  output_dim=self.emb_dim,
+                 mask_zero=True,
                  trainable=False,
                  name='all_node_embedding_layer',
-                 weights=[self.node_emb_matrix],
-                 batch_input_shape=[self.batch_size, None])(all_node_input)
+                 weights=[self.node_emb_matrix])(all_node_input)
 
         all_concat_layer = tf.keras.layers.concatenate(inputs=[all_rela_embedding_layer, all_node_embedding_layer], name="all_rela_node_concat", axis=-1)
 
         # Next we time all a_t's with y_t
-        a_y_dot_layer = tf.squeeze(dot(inputs=[all_concat_layer, hidden_policy_y], axes=-1, name="a_y_dot"), axis=-1)
+        a_y_dot_layer = tf.squeeze(tf.keras.layers.Dot(axes=-1)(inputs=[all_concat_layer, hidden_policy_y]), axis=-1, name="a_y_dot")
+
+        def custom_activation(x):
+            x = KB.switch(tf.math.is_nan(x), KB.zeros_like(x), x)  # prevent nan values
+            x = KB.switch(KB.equal(KB.exp(x), 1), KB.zeros_like(x), KB.exp(x))
+            return x / KB.sum(x, axis=-1, keepdims=True)
 
         # Then finally get the softmax probability
-        softmax_layer = Softmax(axis=-1, name="softmax")(a_y_dot_layer)
+        softmax_layer = tf.keras.layers.Activation(custom_activation)(a_y_dot_layer)
 
-        model = Model(inputs=[rela_input, node_input, all_rela_input, all_node_input], outputs=[softmax_layer], name="ekar")
+        model = Model(inputs=[rela_input, node_input, all_rela_input, all_node_input, hidden_cell_input, state_cell_input], outputs=[hidden_state, cell_state, softmax_layer], name="ekar")
 
         model.summary()
         return model
@@ -149,10 +163,14 @@ class Ekar(object):
 
 
     def train_batch_paths(self, target_user_ids):
+        self.model.trainable = True
         cur_relas = [self.num_relas - 1] * batch_size
         cur_nodes = target_user_ids
 
-        self.model.reset_states()
+        hidden_cell_states = tf.zeros((self.batch_size, self.state_emb_size))
+        state_cell_states = tf.zeros((self.batch_size, self.state_emb_size))
+
+        # self.model.reset_states()
 
         gradBuffer = self.model.trainable_variables
         grads_memory = list()
@@ -163,51 +181,76 @@ class Ekar(object):
 
         # path = [[item] for item in list(zip(cur_relas, cur_nodes))]
         # # policy_memory = list()
-        loss_per_step = list()
+        loss_memory = list()
 
         for i in range(self.path_length):
             next_actions = [self.lookup_next[cur_node] for cur_node in cur_nodes]
             next_actions = self.mask_batch_next_actions(next_actions, self.keep_rate)
             len_actions = [len(next_action) for next_action in next_actions]
 
-            max_num_options = max([len(actions) for actions in next_actions])
+            next_rels = tf.keras.preprocessing.sequence.pad_sequences([[action[0] for action in actions] for actions in next_actions], padding='post')#, maxlen=self.max_out_degree)
+            next_nodes = tf.keras.preprocessing.sequence.pad_sequences([[action[1] for action in actions] for actions in next_actions], padding='post')#, maxlen=self.max_out_degree)
 
-            next_rels = np.array([[action[0] for action in actions] + [self.num_relas]*(max_num_options-len(actions)) for actions in next_actions], dtype=np.int32)
-            next_nodes = np.array([[action[1] for action in actions]+ [self.num_embs]*(max_num_options-len(actions)) for actions in next_actions], dtype=np.int32)
             cur_relas = np.array(cur_relas, dtype=np.int32)
             cur_nodes = np.array(cur_nodes, dtype=np.int32)
-            with tf.GradientTape() as tape:
+
+            with tf.GradientTape(persistent=True) as tape:
+                tape.watch(self.model.trainable_variables)
                 # get probability of all of nexrt actions
-                probabilities = self.model(inputs=[tf.expand_dims(cur_relas, -1),
+                next_hidden_states, next_cell_states, probabilities = self.model(inputs=[tf.expand_dims(cur_relas, -1),
                                                    tf.expand_dims(cur_nodes, -1),
                                                    next_rels,
-                                                   next_nodes]).numpy()
+                                                   next_nodes,
+                                                   hidden_cell_states,
+                                                   state_cell_states])
+
+                # for next hidden states and cell states
+                hidden_cell_states = next_hidden_states
+                state_cell_states = next_cell_states
+
                 # now we remove all the invalid action probabilities
-                probabilities = [probab[:valid_action_len] / sum(probab[:valid_action_len]) for valid_action_len, probab in zip(len_actions, probabilities)]
-                sampled_ids = [np.random.choice(len(actions), size=1, p=probability)[-1] for actions, probability in zip(next_actions, probabilities)]
-                print(sampled_ids)
+                sampled_ids = list()
+                for probability in probabilities.numpy():
+                    try:
+                        sampled_ids.append(np.random.choice(len(probability), size=1, p=probability)[-1])
+                    except ValueError:
+                        print(probability)
 
+                gathered_probs = tf.gather_nd(probabilities, indices=list(enumerate(sampled_ids)))
                 # compute loss
+                batch_loss = -tf.math.log(gathered_probs)
+                # print(loss)
+                loss_memory.append(batch_loss)
 
-                loss = tf.reduce_mean(-tf.math.log(tf.convert_to_tensor([probs[index] for probs, index in zip(probabilities, sampled_ids)])))
-                print(loss)
-                loss_per_step.append(loss.numpy())
-
-            grads = tape.gradient(loss, self.model.trainable_variables)
+                # this has to stay inside the scope of Tape
+                grads = [tape.gradient(single_loss, self.model.trainable_variables) for single_loss in batch_loss]
             grads_memory.append(grads)
 
             cur_relas = [next_rel[index] for index, next_rel in zip(sampled_ids, next_rels)]
             cur_nodes = [next_node[index] for index, next_node in zip(sampled_ids, next_nodes)]
 
-        mean_reward = np.mean(self.get_rewards(target_user_ids, cur_nodes))
+        rewards = self.get_rewards(target_user_ids, cur_nodes)
 
-        # calculate mean gradient
+        # finalize gradient by multiplying with reward respectively
         for grads in grads_memory:
-            for ix, grad in enumerate(grads):
-                gradBuffer[ix] += mean_reward * grad
+            for i, reward in zip(range(self.batch_size), rewards):
+                for j in range(len(grads[0])):
+                    grads[i][j] = tf.multiply(grads[i][j], reward)
+
+        # update gradBuffer
+        for i in range(self.batch_size):
+            for grads in grads_memory:
+                for ix, grad in enumerate(grads[i]):
+                    gradBuffer[ix] += grad
+
+        # normalize gradients
+        for ix, grad in enumerate(gradBuffer):
+            gradBuffer[ix] = grad / self.batch_size
 
         # apply gradients
         self.optimizer.apply_gradients(zip(gradBuffer, self.model.trainable_variables))
+        return tf.reduce_mean(loss_memory).numpy()
+
 
 
 
@@ -249,7 +292,7 @@ class Ekar(object):
                 probabilities = self.model(inputs=[tf.expand_dims([cur_rela], 0),
                                               tf.expand_dims([cur_node], 0),
                                               tf.expand_dims(next_rels, 0),
-                                              tf.expand_dims(next_nodes, 0)])
+                                              tf.expand_dims(next_nodes, 0),])
             #    print(probabilities)
                 # sample one id for next actions
                 # sampled_id = tf.random.categorical(probabilities, num_samples=1)[-1, 0].numpy()
@@ -313,24 +356,12 @@ class Ekar(object):
         # print(sampled_path)
         # print(policy_memory)
         return 0
-        # with tf.GradientTape() as tape:
-        #     dest_node = sampled_path[-1][-1]  # the destination node of this path
-        #     reward = self.get_reward(user_id, dest_node)
-        #     loss = tf.reduce_sum(-reward * np.log(policy_memory))
-        #     print(-reward * np.log(policy_memory))
-        #     print("loss:\t%f" % loss)
-        #     print("reward:\t%f" % reward)
-
-        # grads = tape.gradient(loss, self.model.trainable_variables)
-        # print("grads:" + str(grads))
-        # self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
-        # return loss
 
 
 if __name__=="__main__":
     data_loader = DataLoader()
-    keep_rate=0.8
-    batch_size = 5
+    keep_rate = 0.8
+    batch_size = 512
     Ekar = Ekar(batch_size, keep_rate, data_loader)
 
     Ekar.train_one_step()

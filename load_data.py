@@ -42,6 +42,10 @@ class DataLoader(object):
         # [entity_id, relation_id, entity_id]
         kg = np.load(self.get_path(self.kg_file_name))
 
+        # we preprocess kg and ratings to make sure no zeros inside
+        ratings = [(u+1, i+1, r) for u, i, r in ratings]
+        kg = [(e1+1, r+1, e2+1) for e1, r, e2 in kg]
+
         self.entity_space, self.item_space, self.item_ref = self.get_entity_item_space(ratings, kg)
         self.user_space, self.user_ref, self.rela_space = self.create_user_rel_space(ratings, kg)
         self.generate_new_ratings_and_kg(ratings, kg)
@@ -256,8 +260,8 @@ class DataLoader(object):
             self.lookup_next[head].append((link, tail))
 
         # we get the maximum value of out-degree in G'
-        max_out_degree = max([len(v) for v in self.lookup_next.values()])
-        print("Maximum value of out-degree in the graph is:\t%d" % max_out_degree)
+        self.max_out_degree = max([len(v) for v in self.lookup_next.values()])
+        print("Maximum value of out-degree in the graph is:\t%d" % self.max_out_degree)
 
         # Then we need to generate a ground-truth reward table for every user
         self.positive_rewards = dict()
@@ -331,13 +335,13 @@ class DataLoader(object):
         # We further constrain our space only with the nodes having ConvE embeddings by initializing embedding matrix with node indexes
         node_emb_matrix = np.zeros([self.num_embs + 1, self.emb_dim], dtype=np.float32)
         for n_id, emb in self.node_embs.items():
-            node_emb_matrix[int(n_id)] = emb
+            node_emb_matrix[int(n_id)+1] = emb  #@TODO: this +1 is because we train the ConvE embedding without making 0 invalid
 
         rel_emb_matrix = np.zeros([self.num_relas + 1, self.emb_dim], dtype=np.float32)
         for r_id, emb in self.rel_embs.items():
             if '_' in r_id:
                 continue
-            rel_emb_matrix[int(r_id)] = emb
+            rel_emb_matrix[int(r_id)+1] = emb #@TODO: this +1 is because we train the ConvE embedding without making 0 invalid
         return node_emb_matrix, rel_emb_matrix
 
 
