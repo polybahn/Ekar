@@ -8,6 +8,8 @@ import tensorflow.keras.backend as KB
 from load_data import DataLoader
 import numpy as np
 import tensorflow as tf
+import tensorflow_probability as tfp
+
 import os
 import random
 random.seed(123)
@@ -50,6 +52,10 @@ class Ekar(object):
         self.keep_rate = keep_rate
 
 
+    def lookup(self, key):
+        if isinstance(key, tf.Tensor):
+            key = key.numpy()
+        return self.lookup_next[key]
 
     def build_model(self):
         rela_input = Input(shape=(1,), batch_size=self.batch_size, dtype=tf.int32, name="relation_input")
@@ -164,8 +170,8 @@ class Ekar(object):
 
     def train_batch_paths(self, target_user_ids):
         self.model.trainable = True
-        cur_relas = [self.num_relas - 1] * batch_size
-        cur_nodes = target_user_ids
+        cur_relas = np.array([self.num_relas - 1] * batch_size, dtype=np.int32)
+        cur_nodes = np.array(target_user_ids, dtype=np.int32)
 
         hidden_cell_states = tf.zeros((self.batch_size, self.state_emb_size))
         state_cell_states = tf.zeros((self.batch_size, self.state_emb_size))
@@ -179,20 +185,18 @@ class Ekar(object):
         for ix, grad in enumerate(gradBuffer):
             gradBuffer[ix] = grad * 0
 
-        # path = [[item] for item in list(zip(cur_relas, cur_nodes))]
-        # # policy_memory = list()
         loss_memory = list()
 
         for i in range(self.path_length):
-            next_actions = [self.lookup_next[cur_node] for cur_node in cur_nodes]
+            next_actions = [self.lookup(cur_node) for cur_node in cur_nodes]
             next_actions = self.mask_batch_next_actions(next_actions, self.keep_rate)
             len_actions = [len(next_action) for next_action in next_actions]
 
             next_rels = tf.keras.preprocessing.sequence.pad_sequences([[action[0] for action in actions] for actions in next_actions], padding='post')#, maxlen=self.max_out_degree)
             next_nodes = tf.keras.preprocessing.sequence.pad_sequences([[action[1] for action in actions] for actions in next_actions], padding='post')#, maxlen=self.max_out_degree)
 
-            cur_relas = np.array(cur_relas, dtype=np.int32)
-            cur_nodes = np.array(cur_nodes, dtype=np.int32)
+            # cur_relas = np.array(cur_relas, dtype=np.int32)
+            # cur_nodes = np.array(cur_nodes, dtype=np.int32)
 
             with tf.GradientTape(persistent=True) as tape:
                 tape.watch(self.model.trainable_variables)
@@ -204,17 +208,34 @@ class Ekar(object):
                                                    hidden_cell_states,
                                                    state_cell_states])
 
-                # for next hidden states and cell states
-                hidden_cell_states = next_hidden_states
-                state_cell_states = next_cell_states
+
 
                 # now we remove all the invalid action probabilities
                 sampled_ids = list()
-                for probability in probabilities.numpy():
-                    try:
-                        sampled_ids.append(np.random.choice(len(probability), size=1, p=probability)[-1])
-                    except ValueError:
+                for i in range(len(len_actions)):
+                    probability = probabilities.numpy()[i]
+                    dist = tfp.distributions.Categorical(probs=probability)
+                    # try:
+                    # sampled_id = np.random.choice(len(probability), size=1, p=probability)[-1]
+                    sampled_id = dist.sample().numpy()
+                    # print(sampled_id)
+                    # print(next_nodes.shape)
+                    # while next_rels[i][sampled_id] == 0 or next_nodes[i][sampled_id] == 0
+                    if next_nodes[i].tolist()[sampled_id] == 0:
+                        print(sampled_id)
                         print(probability)
+                        print(next_nodes[i])
+                    sampled_ids.append(sampled_id)
+                    # except ValueError:
+                    #     print(cur_relas[i])
+                    #     print(cur_nodes[i])
+                        # print(gathered_probs[i])
+
+
+
+                # for next hidden states and cell states
+                hidden_cell_states = next_hidden_states
+                state_cell_states = next_cell_states
 
                 gathered_probs = tf.gather_nd(probabilities, indices=list(enumerate(sampled_ids)))
                 # compute loss
@@ -226,8 +247,11 @@ class Ekar(object):
                 grads = [tape.gradient(single_loss, self.model.trainable_variables) for single_loss in batch_loss]
             grads_memory.append(grads)
 
-            cur_relas = [next_rel[index] for index, next_rel in zip(sampled_ids, next_rels)]
-            cur_nodes = [next_node[index] for index, next_node in zip(sampled_ids, next_nodes)]
+            cur_relas = tf.gather_nd(next_rels, indices=list(enumerate(sampled_ids)))
+            cur_nodes = tf.gather_nd(next_nodes, indices=list(enumerate(sampled_ids)))
+
+            # cur_relas = [next_rel[index] for index, next_rel in zip(sampled_ids, next_rels)]
+            # cur_nodes = [next_node[index] for index, next_node in zip(sampled_ids, next_nodes)]
 
         rewards = self.get_rewards(target_user_ids, cur_nodes)
 
@@ -293,7 +317,6 @@ class Ekar(object):
                                               tf.expand_dims([cur_node], 0),
                                               tf.expand_dims(next_rels, 0),
                                               tf.expand_dims(next_nodes, 0),])
-            #    print(probabilities)
                 # sample one id for next actions
                 # sampled_id = tf.random.categorical(probabilities, num_samples=1)[-1, 0].numpy()
                 sampled_id = np.random.choice(num_next_options, size=1, p=probabilities[-1].numpy())[-1]

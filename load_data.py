@@ -46,6 +46,7 @@ class DataLoader(object):
         ratings = [(u+1, i+1, r) for u, i, r in ratings]
         kg = [(e1+1, r+1, e2+1) for e1, r, e2 in kg]
 
+
         self.entity_space, self.item_space, self.item_ref = self.get_entity_item_space(ratings, kg)
         self.user_space, self.user_ref, self.rela_space = self.create_user_rel_space(ratings, kg)
         self.generate_new_ratings_and_kg(ratings, kg)
@@ -71,7 +72,7 @@ class DataLoader(object):
         with open(self.get_path(self.item_2_entity_map_name), 'r') as id_map:
             for line in id_map:
                 item_id, entity_id = [int(e) for e in line.strip().split('\t')]
-                eimap[entity_id] = item_id
+                eimap[entity_id+1] = item_id+1
         return eimap
 
     def get_entity_item_space(self, ratings, kg):
@@ -104,7 +105,7 @@ class DataLoader(object):
             # also update reference to the new item
             self.eimap[e] = temp
         # so far the item_space are all items & entities next we create a mapping from item_id -> id in whole graph
-        item_ref = dict(zip(item_space, range(len(item_space))))
+        item_ref = dict(zip(item_space, range(1, len(item_space)+1)))
         return entity_space, item_space, item_ref
 
 
@@ -112,7 +113,7 @@ class DataLoader(object):
         # then we create a mapping from user_id -> new_id
         user_space = set()
         user_ref = dict()
-        cur_id = len(self.item_space)
+        cur_id = len(self.item_space) + 1
         for u, _, _ in ratings:
             if u not in user_space:
                 user_space.add(u)
@@ -206,13 +207,13 @@ class DataLoader(object):
         self.num_relas = len(self.rela_space)
 
         # assert the globl id is continuously growing and no missing id in between
-        ass_id = [False] * (self.num_users + self.num_items)
+        ass_id = [False] * (self.num_users + self.num_items + 1)
         for v in self.item_ref.values():
             ass_id[v] = True
         for v in self.user_ref.values():
             ass_id[v] = True
-        for i in ass_id:
-            if not i:
+        for index, i in enumerate(ass_id):
+            if not i and not index == 0:
                 print("assertion not passed. exit")
                 exit(-1)
 
