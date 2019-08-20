@@ -9,12 +9,13 @@ from load_data import DataLoader
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
+import operator
 
 import os
 import random
-random.seed(123)
-np.random.seed(123)
-tf.random.set_seed(123)
+random.seed(3115)
+np.random.seed(3115)
+tf.random.set_seed(3115)
 
 
 
@@ -24,8 +25,10 @@ class Ekar(object):
         self.batch_size = batch_size
         self.emb_dim = 32
         self.path_length = 3    # here we define the path length everytime we sample. It's the T in the original paper
-        self.state_emb_size = 20
+        self.state_emb_size = 100
         self.action_emb_size = self.emb_dim * 2    # the input is always a concatenation of [relation, entity] embedding, thus size of 2 x emb_size
+        self.beam_width = 64
+
 
         self.num_users = data_loader.num_users
         self.num_items = data_loader.num_items
@@ -51,10 +54,16 @@ class Ekar(object):
         self.positive_rewards = data_loader.positive_rewards
         self.keep_rate = keep_rate
 
+        self.train_set = data_loader.train_set
+        self.val_dict = data_loader.val_dict
+        self.test_dict = data_loader.test_dict
+
 
     def lookup(self, key):
         if isinstance(key, tf.Tensor):
             key = key.numpy()
+        if key == 0:
+            return []
         return self.lookup_next[key]
 
     def build_model(self):
@@ -176,8 +185,6 @@ class Ekar(object):
         hidden_cell_states = tf.zeros((self.batch_size, self.state_emb_size))
         state_cell_states = tf.zeros((self.batch_size, self.state_emb_size))
 
-        # self.model.reset_states()
-
         gradBuffer = self.model.trainable_variables
         grads_memory = list()
 
@@ -190,13 +197,11 @@ class Ekar(object):
         for i in range(self.path_length):
             next_actions = [self.lookup(cur_node) for cur_node in cur_nodes]
             next_actions = self.mask_batch_next_actions(next_actions, self.keep_rate)
-            len_actions = [len(next_action) for next_action in next_actions]
-
-            next_rels = tf.keras.preprocessing.sequence.pad_sequences([[action[0] for action in actions] for actions in next_actions], padding='post')#, maxlen=self.max_out_degree)
-            next_nodes = tf.keras.preprocessing.sequence.pad_sequences([[action[1] for action in actions] for actions in next_actions], padding='post')#, maxlen=self.max_out_degree)
-
-            # cur_relas = np.array(cur_relas, dtype=np.int32)
-            # cur_nodes = np.array(cur_nodes, dtype=np.int32)
+            # len_actions = [len(next_action) for next_action in next_actions]
+            next_rels = [[rel for rel, node in actions] for actions in next_actions]
+            next_nodes = [[node for rel, node in actions] for actions in next_actions]
+            next_rels = tf.keras.preprocessing.sequence.pad_sequences(next_rels, padding='post')
+            next_nodes = tf.keras.preprocessing.sequence.pad_sequences(next_nodes, padding='post')
 
             with tf.GradientTape(persistent=True) as tape:
                 tape.watch(self.model.trainable_variables)
@@ -207,32 +212,8 @@ class Ekar(object):
                                                    next_nodes,
                                                    hidden_cell_states,
                                                    state_cell_states])
-
-
-
                 # now we remove all the invalid action probabilities
-                sampled_ids = list()
-                for i in range(len(len_actions)):
-                    probability = probabilities.numpy()[i]
-                    dist = tfp.distributions.Categorical(probs=probability)
-                    # try:
-                    # sampled_id = np.random.choice(len(probability), size=1, p=probability)[-1]
-                    sampled_id = dist.sample().numpy()
-                    # print(sampled_id)
-                    # print(next_nodes.shape)
-                    # while next_rels[i][sampled_id] == 0 or next_nodes[i][sampled_id] == 0
-                    if next_nodes[i].tolist()[sampled_id] == 0:
-                        print(sampled_id)
-                        print(probability)
-                        print(next_nodes[i])
-                    sampled_ids.append(sampled_id)
-                    # except ValueError:
-                    #     print(cur_relas[i])
-                    #     print(cur_nodes[i])
-                        # print(gathered_probs[i])
-
-
-
+                sampled_ids = [tfp.distributions.Categorical(probs=probability).sample().numpy() for probability in probabilities]
                 # for next hidden states and cell states
                 hidden_cell_states = next_hidden_states
                 state_cell_states = next_cell_states
@@ -276,74 +257,102 @@ class Ekar(object):
         return tf.reduce_mean(loss_memory).numpy()
 
 
+    def beam_search(self, user_ids):
+        self.model.trainable = False
+
+        cur_relas = [self.num_relas - 1] * batch_size
+        cur_nodes = user_ids
+
+        cur_time_paths = tf.convert_to_tensor([[(rel, node)] for rel, node in zip(cur_relas, cur_nodes)], dtype=tf.int32)
 
 
+        cur_time_probability = None
+        cur_time_hidden_cell_states = tf.zeros([self.batch_size, 1, self.state_emb_size], dtype=tf.float32) #[batch, beam, emb_size]
+        cur_time_state_cell_states = tf.zeros([self.batch_size, 1, self.state_emb_size], dtype=tf.float32) #[batch, beam, emb_size]
+        cur_time_paths = tf.reshape(cur_time_paths, [self.batch_size, 1, 1, 2])  #[batch, beam, cur_len, (edge, node)]
+        for i in range(self.path_length):
+            # we maintain one current path and possibility
+            next_level_paths = tf.zeros([self.batch_size, self.beam_width, i+2, 2], dtype=tf.int32)
+            next_probabilities = tf.zeros([self.batch_size, self.beam_width], dtype=tf.float32)
+            next_level_hidden = tf.zeros([self.batch_size, self.beam_width, self.state_emb_size], dtype=tf.float32)
+            next_level_cell = tf.zeros([self.batch_size, self.beam_width, self.state_emb_size], dtype=tf.float32)
 
-    def train_one_path(self, path_length, target_user_general_id):
-        #     self.model.trainable = False
-        cur_rela = self.num_relas - 1
-        cur_node = target_user_general_id  # here we sample one user form the training set
+            for slice_id in range(cur_time_paths.shape[1]):
+                cur_paths = tf.slice(cur_time_paths, begin=[0, slice_id, 0, 0], size=[self.batch_size, 1, -1, 2])
+                cur_actions = tf.reshape(tf.slice(cur_time_paths, begin=[0, slice_id, i, 0], size=[self.batch_size, 1, -1, 2]), [self.batch_size, 2])
+                # print(cur_actions.shape)
+                hidden_cell_states = tf.reshape(tf.slice(cur_time_hidden_cell_states, begin=[0, slice_id, 0], size=[self.batch_size, 1, -1]), [self.batch_size, self.state_emb_size])
+                state_cell_states = tf.reshape(tf.slice(cur_time_state_cell_states, begin=[0, slice_id, 0], size=[self.batch_size, 1, -1]), [self.batch_size, self.state_emb_size])
 
-        # every time a new path comes in, we need to reset model initial state s_0
-        self.model.reset_states()
-        gradBuffer = self.model.trainable_variables
-        grads_memory = list()
+                cur_rels, cur_nodes = tf.unstack(cur_actions, axis=-1)
+                next_actions = [self.lookup(cur_node) for cur_node in cur_nodes]
+                max_next_len = max([len(acts) for acts in next_actions])
+                next_rels = tf.keras.preprocessing.sequence.pad_sequences(
+                    [[action[0] for action in actions] for actions in next_actions],
+                    padding='post', maxlen=max(max_next_len, self.beam_width))
+                next_nodes = tf.keras.preprocessing.sequence.pad_sequences(
+                    [[action[1] for action in actions] for actions in next_actions],
+                    padding='post', maxlen=max(max_next_len, self.beam_width))
 
-        # clear grad buffer
-        for ix, grad in enumerate(gradBuffer):
-            gradBuffer[ix] = grad * 0
+                next_hidden_states, next_cell_states, probabilities = self.model(inputs=[tf.expand_dims(cur_relas, -1),
+                                                                                         tf.expand_dims(cur_nodes, -1),
+                                                                                         next_rels,
+                                                                                         next_nodes,
+                                                                                         hidden_cell_states,
+                                                                                         state_cell_states])
+                hidden_cell_states = next_hidden_states
+                state_cell_states = next_cell_states
 
-        path = [(cur_rela, cur_node)]
-        policy_memory = list()
-        loss_per_step = list()
-        for i in range(path_length):
-            # get all id for next state
-            next_actions = np.array(self.lookup_next[cur_node], dtype=np.int32)
-            #         print(next_actions.shape)
-            # actions after masking
-            next_actions = self.mask_next_actions(next_actions, self.keep_rate)
-            num_next_options = next_actions.shape[0]
-            #         print(next_actions.shape)
-            # extend action space length to maximum number of out degree
+                # print(hidden_cell_states.shape)
+                # print(probabilities.shape)
+                top_k_probs, top_k_indices = tf.math.top_k(probabilities, k=self.beam_width)
+                # print(top_k_probs.shape)
+                nd_indices = [[[i, indice] for indice in indices] for i, indices in enumerate(top_k_indices)]
+                next_rels = tf.gather_nd(next_rels, indices=nd_indices)
+                next_nodes = tf.gather_nd(next_nodes, indices=nd_indices)
+                # stack to form the next actions
+                next_actions = tf.reshape(tf.stack([next_rels, next_nodes], axis=-1), [self.batch_size, self.beam_width, 1, 2])
+                # print(next_actions.shape)
 
-            next_rels, next_nodes = tf.unstack(next_actions,
-                                               axis=-1)  # unzip the actions to make rela_list and node_list
-            #         print(next_rels)
-            #         print(tf.expand_dims(next_nodes, 0))
+                # get next paths
+                cur_paths = tf.tile(cur_paths, [1, self.beam_width, 1, 1])
+                # print(cur_paths.shape)
+                cur_paths = tf.concat([cur_paths, next_actions], axis=-2)
+                # print(cur_paths.shape)
 
-            with tf.GradientTape() as tape:
-                # get probability of all of nexrt actions
-                probabilities = self.model(inputs=[tf.expand_dims([cur_rela], 0),
-                                              tf.expand_dims([cur_node], 0),
-                                              tf.expand_dims(next_rels, 0),
-                                              tf.expand_dims(next_nodes, 0),])
-                # sample one id for next actions
-                # sampled_id = tf.random.categorical(probabilities, num_samples=1)[-1, 0].numpy()
-                sampled_id = np.random.choice(num_next_options, size=1, p=probabilities[-1].numpy())[-1]
-                # compute loss
-                loss = - tf.math.log(probabilities[-1][sampled_id])
-                loss_per_step.append(loss.numpy())
-            # compute gradients in this step
-            grads = tape.gradient(loss, self.model.trainable_variables)
-            grads_memory.append(grads)
+                # get next hiddens and cells
+                hidden_cell_states = tf.tile(hidden_cell_states, [1, self.beam_width])
+                hidden_cell_states = tf.reshape(hidden_cell_states, [self.batch_size, self.beam_width, self.state_emb_size])
+                # print(hidden_cell_states.shape)
+                state_cell_states = tf.tile(state_cell_states, [1, self.beam_width])
+                state_cell_states = tf.reshape(state_cell_states, [self.batch_size, self.beam_width, self.state_emb_size])
+                # print(state_cell_states.shape)
 
-            # now we have the input for next step
-            policy_memory.append(probabilities[-1][sampled_id].numpy())
-            # update current relation and node for entering next step
-            cur_rela, cur_node = next_actions[sampled_id]
-            path.append((cur_rela, cur_node))
+                # append current solution to existing ones
+                next_level_paths = tf.concat([next_level_paths, cur_paths], axis=1)
+                next_probabilities = tf.concat([next_probabilities, top_k_probs], axis=1)
+                next_level_hidden = tf.concat([next_level_hidden, hidden_cell_states], axis=1)
+                next_level_cell = tf.concat([next_level_cell, state_cell_states], axis=1)
+                # print(next_level_paths.shape)
 
-        # get reward of this path
-        dest_node = path[-1][-1]  # the destination node of this path
-        reward = self.get_reward(target_user_general_id, dest_node)
-        # calculate gradients
-        for grads in grads_memory:
-            for ix, grad in enumerate(grads):
-                gradBuffer[ix] += reward * grad
+                # reshape next level data
+                next_probabilities, top_k_indices = tf.math.top_k(next_probabilities, k=self.beam_width)
+                nd_indices = [[[i, indice] for indice in indices] for i, indices in enumerate(top_k_indices)]
+                # print(next_probabilities.shape)
+                next_level_paths = tf.gather_nd(next_level_paths, indices=nd_indices)
+                next_level_hidden = tf.gather_nd(next_level_hidden, indices=nd_indices)
+                next_level_cell = tf.gather_nd(next_level_cell, indices=nd_indices)
+                # print(next_level_paths.shape)
+                # print(next_level_hidden.shape)
+                # print(next_level_cell.shape)
+            # update cur_path
+            cur_time_paths = next_level_paths
+            cur_time_hidden_cell_states = next_level_hidden
+            cur_time_state_cell_states = next_level_cell
+            cur_time_probability = next_probabilities
+            # print("cur_time_paths" + str(cur_time_paths.shape))
 
-        # apply gradients
-        self.optimizer.apply_gradients(zip(gradBuffer, self.model.trainable_variables))
-        return path, policy_memory, loss_per_step
+        return cur_time_paths, cur_time_probability
 
     def sigmoid_similarity_lookup_phi(self, first_node, second_node):
         if (first_node, second_node) in self.reward_table:
@@ -369,55 +378,96 @@ class Ekar(object):
         return Adam(learning_rate=0.001, clipnorm=1.)
 
     # @tf.function
-    def train_one_step(self):
+    def train_one_step(self, user_ids):
         # first sample one target user
         user_ids = self.sample_batch_users()
         # then sample a path of this user
-        # sampled_path, policy_memory, loss_per_step = \
-
         self.train_batch_paths(user_ids)
-        # print(sampled_path)
-        # print(policy_memory)
         return 0
+
+    def evaluate(self, ndcg_n):
+        # compute perfect possible dcg
+        idcg = np.sum([1/np.log2(i+2) for i in range(ndcg_n)])
+
+        accumulated_prob = .0
+        accumulated_ndcg = .0
+
+        valid_users = tf.data.Dataset.from_tensor_slices(list(self.val_dict.keys()))
+        user_sequences = valid_users.batch(self.batch_size, drop_remainder=True)
+        valid_items = list(self.val_dict.values())
+        item_sequences = [valid_items[i*self.batch_size:i*self.batch_size+self.batch_size] for i in range(int(len(valid_items)//self.batch_size))]
+        print(len(item_sequences))
+
+        hit_accumulator = .0
+        ndcg_accumulator = .0
+        cnt_total = .0
+        for user_batch, item_batch in zip(user_sequences, item_sequences):
+            output_paths, probabilities = self.beam_search(user_batch)
+            print(output_paths.shape)
+            # print(probabilities)
+            last_nodes = tf.reshape(tf.slice(output_paths, begin=[0, 0, self.path_length, 1], size=[self.batch_size, ndcg_n, 1, 1]), [self.batch_size, ndcg_n]).numpy()
+            # print(last_nodes)
+            batch_hits = np.sum([np.sum([1 if item in positive_items else 0 for item in top_n_items])/ndcg_n for positive_items, top_n_items in zip(item_batch, last_nodes)])
+            batch_dcg = [np.sum([1/np.log2(i+2)if item in positive_items else 0 for i, item in enumerate(top_n_items)]) for positive_items, top_n_items in zip(item_batch, last_nodes)]
+            batch_idcg = [np.sum([1/np.log2(i+2) for i in range(len(positive_items))]) if len(positive_items) < ndcg_n else idcg for positive_items in item_batch]
+            batch_ndcg = sum([s_dcg/s_idcg for s_dcg, s_idcg in zip(batch_dcg, batch_idcg)])
+
+            hit_accumulator += batch_hits
+            ndcg_accumulator += batch_ndcg
+            cnt_total += self.batch_size
+        avg_hits_prob = hit_accumulator / cnt_total
+        avg_ndcg_prob = ndcg_accumulator / cnt_total
+        return avg_hits_prob, avg_ndcg_prob
+
+
 
 
 if __name__=="__main__":
     data_loader = DataLoader()
     keep_rate = 0.8
-    batch_size = 512
-    Ekar = Ekar(batch_size, keep_rate, data_loader)
+    batch_size = 128
+    ndcg_n = 10
+    ekar = Ekar(batch_size, keep_rate, data_loader)
 
-    Ekar.train_one_step()
+    BUFFER_SIZE = 10000
+    training_epoch = 1000
 
-# if __name__=="__main__":
-#
-#     data_loader = DataLoader()
-#     keep_rate=0.8
-#     batch_size = 512
-#     Ekar = Ekar(batch_size, keep_rate, data_loader)
-#
-#     epoch_num = 300000
-#     node_number = 13771
-#
-#     # Directory where the checkpoints will be saved
-#     checkpoint_dir = './training_checkpoints'
-#     # Name of the checkpoint files
-#     checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt_{epoch}")
-#
-#     num_path = 0
-#     cumulative_loss = .0
-#     epoch = 0
-#     while True:
-#         if epoch == epoch_num:
-#             break
-#
-#         if num_path == node_number:
-#             print("number path sampled: %d" % num_path)
-#             print("averaged loss: %f" % (cumulative_loss/num_path))
-#             Ekar.model.save_weights(checkpoint_prefix.format(epoch=epoch))
-#             epoch += 1
-#             cumulative_loss = .0
-#             num_path = 0
-#         step_loss = Ekar.train_one_step()
-#         cumulative_loss += step_loss
-#         num_path += 1
+    # Directory where the checkpoints will be saved
+    checkpoint_dir = './training_checkpoints'
+    # Name of the checkpoint files
+    checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt_{epoch}")
+
+    if os.path.exists(checkpoint_dir):
+        ekar.model.load_weights(tf.train.latest_checkpoint(checkpoint_dir))
+
+    # Creating training dataset
+    train_users = [u for u, _, _ in ekar.train_set]
+    node_number = len(train_users)
+    print("total training nodes per epoch:\t%d" % node_number)
+    train_users = tf.data.Dataset.from_tensor_slices(train_users)\
+        .repeat(training_epoch)\
+        .shuffle(BUFFER_SIZE)\
+        .batch(batch_size, drop_remainder=True)
+
+
+    # Training
+    batch_trained = 0
+    epoch = 0
+    batches_per_epoch = int(node_number//batch_size)
+    train_loss_accumulator = .0
+    for batch_users in train_users:
+        batch_train_loss = ekar.train_batch_paths(batch_users.numpy())
+        batch_trained += 1
+        print("training loss at batch %d:\t%f" % (batch_trained, batch_train_loss))
+        train_loss_accumulator += batch_train_loss
+        # Evaluation
+        if batch_trained % batches_per_epoch == 0:
+            epoch += 1
+            print("average training loss at epoch %d:\t%.5f" % (epoch, train_loss_accumulator/batches_per_epoch))
+            train_loss_accumulator = .0
+            ekar.model.save_weights(checkpoint_prefix.format(epoch=epoch))
+            hr_10, ndcg_10 = ekar.evaluate(ndcg_n)
+            print("averaged hit rate at %d:\t%.5f " % (ndcg_n, hr_10))
+            print("averaged NDCG at %d:\t%.5f " % (ndcg_n, ndcg_10))
+
+
