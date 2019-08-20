@@ -302,7 +302,7 @@ class DataLoader(object):
         scores = np.load(path, allow_pickle=True).item()
         scores_final = dict()
         for key, val in scores.items():
-            new_key = (key[0], key[-1])
+            new_key = (int(key[0])+1, int(key[-1])+1)
             old_score = .0
             if new_key in scores_final:
                 old_score = scores_final[new_key]
@@ -316,8 +316,11 @@ class DataLoader(object):
             path = "/Users/polybahn/Desktop/ConvE/data/"
             return np.load(path + d_type + '_node.npy', allow_pickle=True).item()
 
-        self.node_embs = dict()
-        self.node_embs.update(lnp_n('full'))
+
+
+        node_embs_old = dict()
+        node_embs_old.update(lnp_n('full'))
+        self.node_embs = dict([(int(k)+1, v) for k, v in node_embs_old.items()])
 
         print(len(self.node_embs.keys()))
         print(list(self.node_embs.values())[0])
@@ -328,31 +331,31 @@ class DataLoader(object):
             path = "/Users/polybahn/Desktop/ConvE/data/"
             return np.load(path + d_type + '_rel.npy', allow_pickle=True).item()
 
-        self.rel_embs = dict()
-        self.rel_embs.update(lnp_r('full'))
+        rel_embs_old = dict()
+        rel_embs_old.update(lnp_r('full'))
+        self.rel_embs = dict([(int(k)+1, v) for k, v in rel_embs_old.items() if '_' not in k])
         print(self.rel_embs.keys())
 
         # first we create an lookup table for reward
-        invalid_user_num = 0
-        invalid_item_num = 0
         self.reward_table = dict()
-
+        valid_num = 0
         # add reward according to phi function
         score_phi = self.load_phi_scores()
         for user in self.all_users:
-            user_id = str(user)
-            if user_id not in self.node_embs:
-                invalid_user_num += 1
+            if user not in self.node_embs:
                 continue
             for item in self.all_items:
-                item_id = str(item)
-                if item_id not in self.node_embs:
-                    invalid_item_num += 1
+                if item not in self.node_embs:
                     continue
                 # add reward
-                if (user_id, item_id) in score_phi:
-                    self.reward_table[(user, item)] = score_phi[(user_id, item_id)]
+                if (user, item) in score_phi:
+                    valid_num += 1
+                    self.reward_table[(user, item)] = score_phi[(user, item)]
+                if (item, user) in score_phi:
+                    valid_num += 1
+                    self.reward_table[(user, item)] = score_phi[(item, user)]
                     # print("phi:\t" + str(score_phi[(user_id, item_id)]))
+        print("valid_num: %d" % valid_num)
         # add positive reward from the ratings in dataset
         for user, item, _ in self.train_set:
             self.reward_table[(user, item)] = 1.0
@@ -361,13 +364,13 @@ class DataLoader(object):
         # We further constrain our space only with the nodes having ConvE embeddings by initializing embedding matrix with node indexes
         node_emb_matrix = np.zeros([self.num_embs + 1, self.emb_dim], dtype=np.float32)
         for n_id, emb in self.node_embs.items():
-            node_emb_matrix[int(n_id)+1] = emb  #@TODO: this +1 is because we train the ConvE embedding without making 0 invalid
+            node_emb_matrix[n_id] = emb
 
         rel_emb_matrix = np.zeros([self.num_relas + 1, self.emb_dim], dtype=np.float32)
         for r_id, emb in self.rel_embs.items():
-            if '_' in r_id:
-                continue
-            rel_emb_matrix[int(r_id)+1] = emb #@TODO: this +1 is because we train the ConvE embedding without making 0 invalid
+            # if '_' in r_id:
+            #     continue
+            rel_emb_matrix[r_id] = emb
         return node_emb_matrix, rel_emb_matrix
 
 

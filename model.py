@@ -44,7 +44,10 @@ class Ekar(object):
                 if np.isinf(self.node_emb_matrix[i][j]):
                     print("nan!")
                     print(self.node_emb_matrix[i][j])
-
+        print(self.node_emb_matrix[0])
+        print(self.rel_emb_matrix[0])
+        print(self.node_emb_matrix[1])
+        print(self.rel_emb_matrix[1])
 
         self.model = self.build_model()
         self.optimizer = self.get_optimizer()
@@ -218,7 +221,7 @@ class Ekar(object):
                 hidden_cell_states = next_hidden_states
                 state_cell_states = next_cell_states
 
-                gathered_probs = tf.gather_nd(probabilities, indices=list(enumerate(sampled_ids)))
+                gathered_probs = tf.gather_nd(probabilities, indices=list(enumerate(sampled_ids))) + (1e-7)
                 # compute loss
                 batch_loss = -tf.math.log(gathered_probs)
                 # print(loss)
