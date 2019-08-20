@@ -25,7 +25,7 @@ class Ekar(object):
         self.batch_size = batch_size
         self.emb_dim = 32
         self.path_length = 3    # here we define the path length everytime we sample. It's the T in the original paper
-        self.state_emb_size = 100
+        self.state_emb_size = 60
         self.action_emb_size = self.emb_dim * 2    # the input is always a concatenation of [relation, entity] embedding, thus size of 2 x emb_size
         self.beam_width = 64
 
@@ -254,6 +254,8 @@ class Ekar(object):
 
         # apply gradients
         self.optimizer.apply_gradients(zip(gradBuffer, self.model.trainable_variables))
+        print(rewards)
+        print(loss_memory)
         return tf.reduce_mean(loss_memory).numpy()
 
 
@@ -425,12 +427,12 @@ class Ekar(object):
 if __name__=="__main__":
     data_loader = DataLoader()
     keep_rate = 0.8
-    batch_size = 128
+    batch_size = 64
     ndcg_n = 10
     ekar = Ekar(batch_size, keep_rate, data_loader)
 
     BUFFER_SIZE = 10000
-    training_epoch = 1000
+    training_epoch = 10
 
     # Directory where the checkpoints will be saved
     checkpoint_dir = './training_checkpoints'
@@ -456,6 +458,7 @@ if __name__=="__main__":
     batches_per_epoch = int(node_number//batch_size)
     train_loss_accumulator = .0
     for batch_users in train_users:
+        print(batch_users)
         batch_train_loss = ekar.train_batch_paths(batch_users.numpy())
         batch_trained += 1
         print("training loss at batch %d:\t%f" % (batch_trained, batch_train_loss))
